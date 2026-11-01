@@ -23,6 +23,12 @@ class SleepActivity final : public Activity {
   void renderLastScreenSleepScreen() const;
   void renderTransparentCustomSleepScreen() const;
   void renderBlankSleepScreen() const;
+#if defined(FSC_WEATHER_DASHBOARD)
+  void renderDashboardSleepScreen() const;
+#endif
+#if defined(FSC_SLEEP_NOW_READING)
+  void renderInfoSleepScreen() const;
+#endif
 
   bool fromTimeout = false;
 };

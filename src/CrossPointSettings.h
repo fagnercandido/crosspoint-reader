@@ -22,6 +22,12 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
     BLANK = 5,
     QUICK_RESUME = 6,
     TRANSPARENT_CUSTOM = 7,
+#if defined(FSC_SLEEP_NOW_READING)
+    NOW_READING = 8,
+#endif
+#if defined(FSC_WEATHER_DASHBOARD)
+    DASHBOARD = 9,
+#endif
     SLEEP_SCREEN_MODE_COUNT
   };
   enum SLEEP_SCREEN_COVER_MODE { FIT = 0, CROP = 1, SLEEP_SCREEN_COVER_MODE_COUNT };

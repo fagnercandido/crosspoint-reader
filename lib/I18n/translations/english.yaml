@@ -462,3 +462,9 @@ STR_FIRMWARE_WRITE_FAILED: "Firmware write failed"
 STR_FIRMWARE_UPDATE_DO_NOT_POWER_OFF: "Do not power off!"
 STR_RECOVERY_MODE: "Recovery Mode"
 STR_RECOVERY_MODE_HINT: "Place firmware.bin on SD card root and select it"
+
+STR_NOW_READING: "Now Reading"
+
+STR_WEATHER: "Weather"
+
+STR_DASHBOARD: "Dashboard"

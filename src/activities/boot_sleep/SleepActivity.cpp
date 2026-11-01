@@ -8,6 +8,14 @@
 #include <HalDisplay.h>
 #include <HalGPIO.h>
 #include <HalStorage.h>
+#if defined(FSC_WEATHER_DASHBOARD)
+#include <WiFi.h>
+#include "network/WeatherData.h"
+#endif
+#if defined(FSC_SLEEP_NOW_READING)
+#include <HalClock.h>
+#include <HalPowerManager.h>
+#endif
 #include <I18n.h>
 #include <Memory.h>
 #include <PNGdec.h>
@@ -544,7 +552,15 @@ void SleepActivity::onEnter() {
       } else {
         return renderCustomSleepScreen();
       }
-    default:
+#if defined(FSC_SLEEP_NOW_READING)
+    case (CrossPointSettings::SLEEP_SCREEN_MODE::NOW_READING):
+      return renderInfoSleepScreen();
+#endif
+#if defined(FSC_WEATHER_DASHBOARD)
+    case (CrossPointSettings::SLEEP_SCREEN_MODE::DASHBOARD):
+      return renderDashboardSleepScreen();
+#endif
+        default:
       return renderDefaultSleepScreen();
   }
 }
@@ -842,3 +858,307 @@ void SleepActivity::renderBlankSleepScreen() const {
   renderer.clearScreen();
   renderer.displayBuffer(HalDisplay::HALF_REFRESH);
 }
+
+#if defined(FSC_SLEEP_NOW_READING)
+void SleepActivity::renderInfoSleepScreen() const {
+  const auto pageWidth = renderer.getScreenWidth();
+  const auto pageHeight = renderer.getScreenHeight();
+  const std::string& path = APP_STATE.openEpubPath;
+
+  std::string title, author, coverBmpPath;
+  const bool cropped = SETTINGS.sleepScreenCoverMode == CrossPointSettings::SLEEP_SCREEN_COVER_MODE::CROP;
+  if (!path.empty() && FsHelpers::hasEpubExtension(path)) {
+    Epub epub(path, "/.crosspoint");
+    if (epub.load(true, true)) {
+      title = epub.getTitle();
+      author = epub.getAuthor();
+      if (epub.generateCoverBmp(cropped)) coverBmpPath = epub.getCoverBmpPath(cropped);
+    }
+  }
+  if (title.empty() && !path.empty()) {
+    const size_t slash = path.find_last_of('/');
+    std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    const size_t dot = name.find_last_of('.');
+    title = (dot == std::string::npos) ? name : name.substr(0, dot);
+  }
+  if (title.empty()) title = tr(STR_CROSSPOINT);
+
+  const std::string battery = std::to_string(powerManager.getBatteryPercentage()) + "%";
+  char timeBuf[16];
+  const bool haveClock = halClock.isAvailable() &&
+      halClock.formatTime(timeBuf, sizeof(timeBuf), SETTINGS.clockUtcOffsetQ, SETTINGS.clockFormat == 1);
+
+  renderer.clearScreen();
+
+  bool haveCover = false;
+  if (!coverBmpPath.empty()) {
+    HalFile file;
+    if (Storage.openFileForRead("SLP", coverBmpPath, file)) {
+      Bitmap bitmap(file);
+      if (bitmap.parseHeaders() == BmpReaderError::Ok) {
+        const auto pl = calculateBitmapPlacement(bitmap.getWidth(), bitmap.getHeight(), renderer);
+        renderer.drawBitmap(bitmap, pl.x, pl.y, pageWidth, pageHeight, pl.cropX, pl.cropY);
+        haveCover = true;
+      }
+    }
+  }
+
+  if (haveCover) {
+    const int barH = 92;
+    const int barY = pageHeight - barH;
+    renderer.fillRect(0, barY, pageWidth, barH, false);
+    renderer.drawCenteredText(UI_12_FONT_ID, barY + 14, title.c_str(), true, EpdFontFamily::BOLD);
+    if (!author.empty()) renderer.drawCenteredText(SMALL_FONT_ID, barY + 44, author.c_str());
+    renderer.drawText(SMALL_FONT_ID, 20, barY + 68, battery.c_str());
+    if (haveClock) {
+      const int w = renderer.getTextWidth(SMALL_FONT_ID, timeBuf);
+      renderer.drawText(SMALL_FONT_ID, pageWidth - 20 - w, barY + 68, timeBuf);
+    }
+  } else {
+    const int titleY = pageHeight / 2 - 20;
+    renderer.drawCenteredText(UI_12_FONT_ID, titleY, title.c_str(), true, EpdFontFamily::BOLD);
+    if (!author.empty()) renderer.drawCenteredText(SMALL_FONT_ID, titleY + 30, author.c_str());
+    const int footerY = pageHeight - 40;
+    renderer.drawText(SMALL_FONT_ID, 24, footerY, battery.c_str());
+    if (haveClock) {
+      const int w = renderer.getTextWidth(SMALL_FONT_ID, timeBuf);
+      renderer.drawText(SMALL_FONT_ID, pageWidth - 24 - w, footerY, timeBuf);
+    }
+    renderer.invertScreen();
+  }
+
+  renderer.displayBuffer(HalDisplay::FULL_REFRESH);
+}
+#endif
+
+#if defined(FSC_WEATHER_DASHBOARD)
+void SleepActivity::renderDashboardSleepScreen() const {
+  const int W = renderer.getScreenWidth();
+  const int H = renderer.getScreenHeight();
+  const int M = 20;  // side margin
+
+  const int lhUI = renderer.getLineHeight(UI_12_FONT_ID);
+  const int lhSm = renderer.getLineHeight(SMALL_FONT_ID);
+  const int lhSerif = renderer.getLineHeight(NOTOSERIF_18_FONT_ID);
+  const int lh10 = renderer.getLineHeight(UI_10_FONT_ID);
+
+  // ---- weather (cache first, refresh over WiFi when stale) ----
+  WeatherData wd;
+  bool haveWeather = WeatherStore::loadCache(wd) && wd.valid;
+  if (WiFi.status() == WL_CONNECTED && (!haveWeather || !WeatherStore::isFresh(wd, 30))) {
+    WeatherData fresh;
+    if (WeatherStore::fetch(fresh)) {
+      wd = fresh;
+      haveWeather = true;
+      WeatherStore::saveCache(wd);
+    }
+  }
+
+  // ---- current book: title/author, cover, saved reading position ----
+  std::string title, author, coverBmpPath;
+  int pctRead = -1, chCur = 0, chTot = 0, pgCur = 0, pgTot = 0;
+  const std::string& path = APP_STATE.openEpubPath;
+  if (!path.empty() && FsHelpers::hasEpubExtension(path)) {
+    Epub epub(path, "/.crosspoint");
+    if (epub.load(true, true)) {
+      title = epub.getTitle();
+      author = epub.getAuthor();
+      if (epub.generateCoverBmp(true)) coverBmpPath = epub.getCoverBmpPath(true);
+      HalFile pf;
+      const std::string pfp = epub.getCachePath() + "/progress.bin";
+      if (Storage.openFileForRead("DSH", pfp, pf)) {
+        uint8_t pb[10] = {0};
+        const int n = pf.read(pb, sizeof(pb));
+        if (n >= 6) {
+          const int spineIndex = pb[0] | (pb[1] << 8);
+          const int pageNumber = pb[2] | (pb[3] << 8);
+          const int pageCount = pb[4] | (pb[5] << 8);
+          const float frac = pageCount > 0 ? static_cast<float>(pageNumber) / static_cast<float>(pageCount) : 0.0f;
+          const int p = static_cast<int>(epub.calculateProgress(spineIndex, frac) * 100.0f + 0.5f);
+          pctRead = p < 0 ? 0 : (p > 100 ? 100 : p);
+          chCur = spineIndex + 1;
+          chTot = epub.getSpineItemsCount();
+          pgCur = pageNumber + 1;
+          pgTot = pageCount;
+        }
+      }
+    }
+  }
+  if (title.empty() && !path.empty()) {
+    const size_t slash = path.find_last_of('/');
+    std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    const size_t dot = name.find_last_of('.');
+    title = (dot == std::string::npos) ? name : name.substr(0, dot);
+  }
+
+  auto centerInBox = [&](int fontId, int bx, int bw, int ty, const char* s) {
+    const int tw = renderer.getTextWidth(fontId, s);
+    renderer.drawText(fontId, bx + (bw - tw) / 2, ty, s);
+  };
+
+  renderer.clearScreen();
+  char buf[64];
+  int y = 14;
+
+  // ===================== HEADER =====================
+  renderer.drawText(UI_12_FONT_ID, M, y, "Home", true, EpdFontFamily::BOLD);
+  if (haveWeather) {
+    std::snprintf(buf, sizeof(buf), "%02d:%02d", wd.wHour, wd.wMin);
+    const int cw = renderer.getTextWidth(UI_12_FONT_ID, buf);
+    renderer.drawText(UI_12_FONT_ID, W - M - cw, y, buf);
+  }
+  y += lhUI + 6;
+  if (haveWeather) {
+    std::snprintf(buf, sizeof(buf), "%s %d %s", WeatherStore::dayName(wd.wYear, wd.wMonth, wd.wDay), wd.wDay,
+                  WeatherStore::monthName(wd.wMonth));
+    renderer.drawText(SMALL_FONT_ID, M, y, buf);
+    y += lhSm;
+  }
+  y += 8;
+  renderer.drawLine(16, y, W - 16, y);
+  y += 16;
+
+  // ===================== WEATHER HERO =====================
+  if (haveWeather) {
+    const int heroTop = y;
+    std::snprintf(buf, sizeof(buf), "%.0f\xC2\xB0", wd.tempC);
+    renderer.drawText(NOTOSERIF_18_FONT_ID, M, heroTop, buf);
+    const int tw = renderer.getTextWidth(NOTOSERIF_18_FONT_ID, buf);
+    const int rx = M + tw + 24;
+    renderer.drawText(UI_12_FONT_ID, rx, heroTop, wd.condition.c_str());
+    std::snprintf(buf, sizeof(buf), "H %.0f\xC2\xB0    L %.0f\xC2\xB0", wd.tMaxC, wd.tMinC);
+    renderer.drawText(SMALL_FONT_ID, rx, heroTop + lhUI + 4, buf);
+    const int rightH = lhUI + 4 + lhSm;
+    const int heroH = (lhSerif > rightH) ? lhSerif : rightH;
+    y = heroTop + heroH + 16;
+
+    // ---- four metric tiles ----
+    const char* labels[4] = {"SENSAÇÃO", "HUMIDADE", "VENTO", "CHUVA"};
+    char vals[4][20];
+    std::snprintf(vals[0], sizeof(vals[0]), "%.0f\xC2\xB0", wd.feelsC);
+    std::snprintf(vals[1], sizeof(vals[1]), "%d%%", wd.humidity);
+    std::snprintf(vals[2], sizeof(vals[2]), "%.0f km/h", wd.windKmh);
+    std::snprintf(vals[3], sizeof(vals[3]), "%d%%", wd.rainProb);
+    const int gap = 8;
+    const int tileW = (W - 2 * M - 3 * gap) / 4;
+    const int tileH = 60;
+    const int tileY = y;
+    for (int i = 0; i < 4; ++i) {
+      const int tx = M + i * (tileW + gap);
+      renderer.drawRect(tx, tileY, tileW, tileH, 1, true);
+      centerInBox(SMALL_FONT_ID, tx, tileW, tileY + 10, vals[i]);
+      centerInBox(UI_10_FONT_ID, tx, tileW, tileY + tileH - lh10 - 8, labels[i]);
+    }
+    y = tileY + tileH + 18;
+  } else {
+    renderer.drawText(SMALL_FONT_ID, M, y, "Tempo indisponível (liga o WiFi)");
+    y += lhSm + 18;
+  }
+
+  // ===================== 5-DAY FORECAST =====================
+  if (haveWeather && wd.haveForecast) {
+    renderer.drawLine(16, y, W - 16, y);
+    y += 14;
+    renderer.drawText(UI_12_FONT_ID, M, y, "PRÓXIMOS DIAS", true, EpdFontFamily::BOLD);
+    y += lhUI + 12;
+    const int gap = 8;
+    const int fW = (W - 2 * M - 4 * gap) / 5;
+    const int fH = 122;
+    const int fY = y;
+    for (int i = 0; i < WeatherData::FORECAST_DAYS; ++i) {
+      const int fx = M + i * (fW + gap);
+      renderer.drawRect(fx, fY, fW, fH, (i == 0) ? 2 : 1, true);
+      centerInBox(SMALL_FONT_ID, fx, fW, fY + 12, WeatherStore::dayShort(wd.fcWday[i]));
+      char hb[12], lb[12];
+      std::snprintf(hb, sizeof(hb), "%d\xC2\xB0", wd.fcHiC[i]);
+      std::snprintf(lb, sizeof(lb), "%d\xC2\xB0", wd.fcLoC[i]);
+      centerInBox(NOTOSERIF_18_FONT_ID, fx, fW, fY + 44, hb);
+      centerInBox(SMALL_FONT_ID, fx, fW, fY + 82, lb);
+    }
+    y = fY + fH + 18;
+  }
+
+  // ===================== READING =====================
+  renderer.drawLine(16, y, W - 16, y);
+  y += 14;
+  renderer.drawText(UI_12_FONT_ID, M, y, "LEITURA", true, EpdFontFamily::BOLD);
+  if (pctRead >= 0) {
+    std::snprintf(buf, sizeof(buf), "%d%%", pctRead);
+    const int pw = renderer.getTextWidth(NOTOSERIF_18_FONT_ID, buf);
+    renderer.drawText(NOTOSERIF_18_FONT_ID, W - M - pw, y - 2, buf);
+  }
+  y += lhUI + 12;
+
+  const int coverW = 64, coverH = 100;
+  const int coverX = M, coverY = y;
+  renderer.drawRect(coverX, coverY, coverW, coverH, 1, true);
+  if (!coverBmpPath.empty()) {
+    HalFile cf;
+    if (Storage.openFileForRead("DSH", coverBmpPath, cf)) {
+      Bitmap bm(cf);
+      if (bm.parseHeaders() == BmpReaderError::Ok) {
+        renderer.drawBitmap(bm, coverX, coverY, coverW, coverH);
+      }
+    }
+  }
+
+  const int tx = coverX + coverW + 16;
+  const int tW = W - M - tx;
+  if (!title.empty()) {
+    const std::string tt = renderer.truncatedText(UI_12_FONT_ID, title.c_str(), tW, EpdFontFamily::BOLD);
+    renderer.drawText(UI_12_FONT_ID, tx, coverY + 2, tt.c_str(), true, EpdFontFamily::BOLD);
+    if (!author.empty()) {
+      const std::string ta = renderer.truncatedText(SMALL_FONT_ID, author.c_str(), tW, EpdFontFamily::REGULAR);
+      renderer.drawText(SMALL_FONT_ID, tx, coverY + 2 + lhUI + 6, ta.c_str());
+    }
+  } else {
+    renderer.drawText(SMALL_FONT_ID, tx, coverY + 2, "Sem livro aberto");
+  }
+  if (pctRead >= 0) {
+    const int barY = coverY + 54;
+    const int barW = tW;
+    renderer.drawRect(tx, barY, barW, 14, 1, true);
+    const int fillW = (barW - 4) * pctRead / 100;
+    if (fillW > 0) renderer.fillRect(tx + 2, barY + 2, fillW, 10, true);
+    std::snprintf(buf, sizeof(buf), "Cap. %d/%d    pág. %d/%d", chCur, chTot, pgCur, pgTot);
+    renderer.drawText(SMALL_FONT_ID, tx, barY + 22, buf);
+  }
+  y = coverY + coverH + 18;
+
+  // ---- reading stat tiles (real, derived from the saved position) ----
+  if (pctRead >= 0) {
+    const char* slabels[3] = {"PROGRESSO", "CAPÍTULO", "PÁGINA"};
+    char svals[3][16];
+    std::snprintf(svals[0], sizeof(svals[0]), "%d%%", pctRead);
+    std::snprintf(svals[1], sizeof(svals[1]), "%d/%d", chCur, chTot);
+    std::snprintf(svals[2], sizeof(svals[2]), "%d/%d", pgCur, pgTot);
+    const int gap = 8;
+    const int tileW = (W - 2 * M - 2 * gap) / 3;
+    // Empilha valor sobre rótulo usando a altura real das fontes: nunca se sobrepõem.
+    const int lhVal = renderer.getLineHeight(NOTOSANS_18_FONT_ID);
+    const int padTop = 6, gapVL = 4, padBot = 6;
+    const int tileH = padTop + lhVal + gapVL + lh10 + padBot;
+    const int tileY = y;
+    for (int i = 0; i < 3; ++i) {
+      const int sx = M + i * (tileW + gap);
+      renderer.drawRect(sx, tileY, tileW, tileH, 1, true);
+      centerInBox(NOTOSANS_18_FONT_ID, sx, tileW, tileY + padTop, svals[i]);
+      centerInBox(UI_10_FONT_ID, sx, tileW, tileY + padTop + lhVal + gapVL, slabels[i]);
+    }
+    y = tileY + tileH + 16;
+  }
+
+  // ===================== FOOTER =====================
+  const int footY = H - 30;
+  renderer.drawLine(16, footY - 14, W - 16, footY - 14);
+  std::snprintf(buf, sizeof(buf), "Bateria %d%%", powerManager.getBatteryPercentage());
+  renderer.drawText(SMALL_FONT_ID, M, footY, buf);
+  if (haveWeather) {
+    std::snprintf(buf, sizeof(buf), "atual. %02d:%02d", wd.wHour, wd.wMin);
+    const int uw = renderer.getTextWidth(SMALL_FONT_ID, buf);
+    renderer.drawText(SMALL_FONT_ID, W - M - uw, footY, buf);
+  }
+
+  renderer.displayBuffer(HalDisplay::FULL_REFRESH);
+}
+#endif

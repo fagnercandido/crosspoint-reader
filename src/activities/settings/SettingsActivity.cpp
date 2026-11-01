@@ -371,7 +371,7 @@ void SettingsActivity::toggleCurrentSetting() {
                                  rebuildSettingsLists();
                                });
         break;
-      case SettingAction::None:
+            case SettingAction::None:
         // Do nothing
         break;
     }

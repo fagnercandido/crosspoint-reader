@@ -209,6 +209,12 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
     sleepScreenValues[CrossPointSettings::BLANK] = StrId::STR_NONE_OPT;
     sleepScreenValues[CrossPointSettings::QUICK_RESUME] = StrId::STR_QUICK_RESUME;
     sleepScreenValues[CrossPointSettings::TRANSPARENT_CUSTOM] = StrId::STR_TRANSPARENT;
+#if defined(FSC_WEATHER_DASHBOARD)
+    sleepScreenValues[CrossPointSettings::DASHBOARD] = StrId::STR_DASHBOARD;
+#endif
+#if defined(FSC_SLEEP_NOW_READING)
+    sleepScreenValues[CrossPointSettings::NOW_READING] = StrId::STR_NOW_READING;
+#endif
 
     std::vector<StrId> statusBarClockValues(CrossPointSettings::STATUS_BAR_CLOCK_MODE_COUNT);
     statusBarClockValues[CrossPointSettings::STATUS_BAR_CLOCK_HIDE] = StrId::STR_HIDE;
